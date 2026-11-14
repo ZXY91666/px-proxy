@@ -1,241 +1,34 @@
 """
-万能 PaaS 代理服务 —— 部署到 Koyeb/Render/Fly.io/Zeabur 等免费平台。
-功能：
-1. HTTP CONNECT 代理（最通用）
-2. SOCKS5 代理
-3. 健康检查
-
-部署后在境外节点上跑，提供干净的境外出口。
-
-启动：python app.py
-平台会设 PORT 环境变量。
+单端口混合代理：同一个端口自动识别 HTTP CONNECT / SOCKS5 / 普通 HTTP。
+这样 Railway 的 TCP proxy 和 HTTP 域名都能用。
 """
 import os
 import socket
+import struct
 import select
 import threading
 import logging
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import time
 
 PORT = int(os.environ.get("PORT", 8080))
-USER = os.environ.get("PROXY_USER", "")
-PASS = os.environ.get("PROXY_PASS", "")
+BUF = 65536
 
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s %(levelname)s %(message)s")
-log = logging.getLogger("proxy")
-
-BUFSIZE = 65536
+log = logging.getLogger("mix")
 
 
-class ConnectHandler(BaseHTTPRequestHandler):
-    """HTTP CONNECT 代理（HTTPS 走这个）。"""
-
-    protocol_version = "HTTP/1.1"
-
-    def log_message(self, fmt, *args):
-        log.info("%s - %s" % (self.address_string(), fmt % args))
-
-    def _check_auth(self):
-        if not USER:
-            return True
-        auth = self.headers.get("Proxy-Authorization", "")
-        if not auth.startswith("Basic "):
-            return False
-        import base64
-        try:
-            dec = base64.b64decode(auth[6:]).decode()
-            u, p = dec.split(":", 1)
-            return u == USER and p == PASS
-        except Exception:
-            return False
-
-    def do_CONNECT(self):
-        if not self._check_auth():
-            self.send_response(407)
-            self.send_header("Proxy-Authenticate", 'Basic realm="proxy"')
-            self.send_header("Content-Length", "0")
-            self.end_headers()
-            return
-
-        host, _, port = self.path.partition(":")
-        try:
-            port = int(port or 443)
-        except Exception:
-            port = 443
-
-        try:
-            upstream = socket.create_connection((host, port), timeout=15)
-        except Exception as e:
-            log.warning("connect %s:%s failed: %s", host, port, e)
-            self.send_response(502)
-            self.send_header("Content-Length", "0")
-            self.end_headers()
-            return
-
-        self.send_response(200, "Connection Established")
-        self.send_header("Proxy-Agent", "paas-proxy")
-        self.end_headers()
-
-        self.wfile.flush()
-        self._tunnel(self.connection, upstream)
-
-    def do_GET(self):
-        """普通 HTTP 代理请求。"""
-        if not self._check_auth():
-            self.send_response(407)
-            self.send_header("Content-Length", "0")
-            self.end_headers()
-            return
-        # 健康检查
-        if self.path in ("/", "/health", "/ping"):
-            body = b'{"ok":true,"proxy":"paas","port":%d}' % PORT
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
-            return
-        # 转发 HTTP
-        self._proxy_http()
-
-    def _proxy_http(self):
-        from urllib.parse import urlparse
-        u = urlparse(self.path)
-        if not u.netloc:
-            self.send_response(400)
-            self.send_header("Content-Length", "0")
-            self.end_headers()
-            return
-        host = u.hostname
-        port = u.port or 80
-        try:
-            upstream = socket.create_connection((host, port), timeout=15)
-        except Exception:
-            self.send_response(502)
-            self.send_header("Content-Length", "0")
-            self.end_headers()
-            return
-
-        path = u.path or "/"
-        if u.query:
-            path += "?" + u.query
-        req = f"{self.command} {path} HTTP/1.1\r\n"
-        for k, v in self.headers.items():
-            if k.lower() in ("proxy-connection", "proxy-authorization"):
-                continue
-            req += f"{k}: {v}\r\n"
-        req += "\r\n"
-        upstream.sendall(req.encode())
-
+def pipe(a, b):
+    socks = [a, b]
+    try:
         while True:
-            r, _, _ = select.select([upstream], [], [], 30)
-            if not r:
-                break
-            data = upstream.recv(BUFSIZE)
-            if not data:
-                break
-            self.wfile.write(data)
-            self.wfile.flush()
-        upstream.close()
-
-    def _tunnel(self, client, upstream):
-        """双向转发。"""
-        socks = [client, upstream]
-        try:
-            while True:
-                r, _, x = select.select(socks, [], socks, 60)
-                if x:
-                    break
-                if not r:
-                    continue
-                for s in r:
-                    other = upstream if s is client else client
-                    try:
-                        data = s.recv(BUFSIZE)
-                    except Exception:
-                        return
-                    if not data:
-                        return
-                    try:
-                        other.sendall(data)
-                    except Exception:
-                        return
-        finally:
-            try:
-                upstream.close()
-            except Exception:
-                pass
-
-
-class Socks5Handler(threading.Thread):
-    """SOCKS5 代理（简化实现）。"""
-
-    def __init__(self, conn, addr):
-        super().__init__(daemon=True)
-        self.conn = conn
-        self.addr = addr
-
-    def run(self):
-        try:
-            self._handle()
-        except Exception:
-            pass
-        finally:
-            try:
-                self.conn.close()
-            except Exception:
-                pass
-
-    def _handle(self):
-        c = self.conn
-        c.settimeout(30)
-        # 握手
-        ver_n = c.recv(2)
-        if len(ver_n) < 2 or ver_n[0] != 5:
-            return
-        nm = ver_n[1]
-        c.recv(nm)
-        c.sendall(b"\x05\x00")  # 无认证
-
-        # 请求
-        hdr = c.recv(4)
-        if len(hdr) < 4:
-            return
-        ver, cmd, rsv, atyp = hdr
-        if atyp == 1:
-            addr = socket.inet_ntoa(c.recv(4))
-        elif atyp == 3:
-            ln = c.recv(1)[0]
-            addr = c.recv(ln).decode()
-        elif atyp == 4:
-            addr = socket.inet_ntop(socket.AF_INET6, c.recv(16))
-        else:
-            return
-        port = int.from_bytes(c.recv(2), "big")
-
-        if cmd != 1:  # 只支持 CONNECT
-            c.sendall(b"\x05\x07\x00\x01" + b"\x00" * 6)
-            return
-
-        try:
-            up = socket.create_connection((addr, port), timeout=15)
-        except Exception:
-            c.sendall(b"\x05\x05\x00\x01" + b"\x00" * 6)
-            return
-
-        c.sendall(b"\x05\x00\x00\x01" + b"\x00" * 6)
-
-        # 转发
-        socks = [c, up]
-        while True:
-            r, _, x = select.select(socks, [], socks, 60)
+            r, _, x = select.select(socks, [], socks, 300)
             if x or not r:
-                break
+                return
             for s in r:
-                other = up if s is c else c
+                other = b if s is a else a
                 try:
-                    data = s.recv(BUFSIZE)
+                    data = s.recv(BUF)
                 except Exception:
                     return
                 if not data:
@@ -244,37 +37,186 @@ class Socks5Handler(threading.Thread):
                     other.sendall(data)
                 except Exception:
                     return
-        up.close()
+    finally:
+        for s in (a, b):
+            try:
+                s.close()
+            except Exception:
+                pass
 
 
-def socks5_server(port):
-    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    srv.bind(("0.0.0.0", port))
-    srv.listen(128)
-    log.info("SOCKS5 listening on %d", port)
-    while True:
-        conn, addr = srv.accept()
-        Socks5Handler(conn, addr).start()
+def handle_http(client, first):
+    """HTTP 代理：CONNECT 或绝对 URI。"""
+    buf = first
+    while b"\r\n\r\n" not in buf:
+        c = client.recv(4096)
+        if not c:
+            client.close()
+            return
+        buf += c
+        if len(buf) > 65536:
+            break
+
+    head = buf.split(b"\r\n\r\n", 1)[0].decode("latin1", "ignore")
+    lines = head.split("\r\n")
+    if not lines:
+        client.close()
+        return
+    parts = lines[0].split()
+    if len(parts) < 2:
+        client.close()
+        return
+    method, target = parts[0], parts[1]
+
+    # 健康检查
+    if method == "GET" and target in ("/", "/health", "/ping"):
+        body = b'{"ok":true,"mode":"mixed"}'
+        client.sendall(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+                       b"Content-Length: " + str(len(body)).encode() +
+                       b"\r\nConnection: close\r\n\r\n" + body)
+        client.close()
+        return
+
+    if method.upper() == "CONNECT":
+        host, _, port_s = target.rpartition(":")
+        if not host:
+            host, port_s = target, "443"
+        try:
+            port = int(port_s)
+        except Exception:
+            port = 443
+        try:
+            up = socket.create_connection((host, port), timeout=25)
+        except Exception as e:
+            log.warning("CONNECT %s:%s fail %s", host, port, e)
+            client.sendall(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
+            client.close()
+            return
+        log.info("CONNECT %s:%s OK", host, port)
+        client.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+        pipe(client, up)
+        return
+
+    # 普通 HTTP
+    if not target.startswith("http://"):
+        client.sendall(b"HTTP/1.1 400 Bad Request\r\n\r\n")
+        client.close()
+        return
+    rest = target[7:]
+    if "/" in rest:
+        hostport, path = rest.split("/", 1)
+        path = "/" + path
+    else:
+        hostport, path = rest, "/"
+    if ":" in hostport:
+        host, port_s = hostport.rsplit(":", 1)
+        port = int(port_s)
+    else:
+        host, port = hostport, 80
+    try:
+        up = socket.create_connection((host, port), timeout=25)
+    except Exception:
+        client.sendall(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
+        client.close()
+        return
+    out = [f"{method} {path} HTTP/1.1"]
+    for ln in lines[1:]:
+        low = ln.lower()
+        if low.startswith(("proxy-connection:", "proxy-authorization:")):
+            continue
+        out.append(ln)
+    up.sendall(("\r\n".join(out) + "\r\n\r\n").encode())
+    # 把已读的额外 body 转发
+    rest_body = buf.split(b"\r\n\r\n", 1)[1] if b"\r\n\r\n" in buf else b""
+    if rest_body:
+        up.sendall(rest_body)
+    pipe(client, up)
+
+
+def handle_socks5(client, first):
+    """SOCKS5。first 是已读的 2 字节（VER, NMETHODS）。"""
+    ver, n = first[0], first[1]
+    if ver != 5:
+        client.close()
+        return
+    methods = b""
+    while len(methods) < n:
+        c = client.recv(n - len(methods))
+        if not c:
+            client.close()
+            return
+        methods += c
+    client.sendall(b"\x05\x00")
+
+    hdr = b""
+    while len(hdr) < 4:
+        c = client.recv(4 - len(hdr))
+        if not c:
+            client.close()
+            return
+        hdr += c
+    cmd, atyp = hdr[1], hdr[3]
+
+    if atyp == 1:
+        addr = socket.inet_ntoa(client.recv(4))
+    elif atyp == 3:
+        ln = client.recv(1)[0]
+        addr = client.recv(ln).decode()
+    elif atyp == 4:
+        addr = socket.inet_ntop(socket.AF_INET6, client.recv(16))
+    else:
+        client.close()
+        return
+    port = int.from_bytes(client.recv(2), "big")
+
+    if cmd != 1:
+        client.sendall(b"\x05\x07\x00\x01" + b"\x00" * 6)
+        client.close()
+        return
+
+    try:
+        up = socket.create_connection((addr, port), timeout=25)
+    except Exception:
+        client.sendall(b"\x05\x05\x00\x01" + b"\x00" * 6)
+        client.close()
+        return
+
+    client.sendall(b"\x05\x00\x00\x01" + b"\x00" * 6)
+    log.info("SOCKS %s:%s OK", addr, port)
+    pipe(client, up)
+
+
+def handle(client, addr):
+    try:
+        client.settimeout(60)
+        first = client.recv(2)
+        if not first:
+            client.close()
+            return
+        if first[0] == 5:
+            handle_socks5(client, first)
+        else:
+            handle_http(client, first)
+    except Exception as e:
+        log.warning("handle err %s", str(e)[:60])
+        try:
+            client.close()
+        except Exception:
+            pass
 
 
 def main():
-    log.info("=== PaaS Proxy starting ===")
-    log.info("HTTP CONNECT port: %d", PORT)
-    if USER:
-        log.info("auth: %s:***", USER)
-
-    # SOCKS5 跑在 PORT+1
-    try:
-        threading.Thread(target=socks5_server, args=(PORT + 1,),
-                         daemon=True).start()
-    except Exception as e:
-        log.warning("socks5 failed: %s", e)
-
-    srv = ThreadingHTTPServer(("0.0.0.0", PORT), ConnectHandler)
-    srv.daemon_threads = True
-    log.info("HTTP proxy listening on %d", PORT)
-    srv.serve_forever()
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind(("0.0.0.0", PORT))
+    srv.listen(256)
+    log.info("=== mixed proxy listening on %d ===", PORT)
+    while True:
+        try:
+            c, a = srv.accept()
+            threading.Thread(target=handle, args=(c, a), daemon=True).start()
+        except Exception:
+            continue
 
 
 if __name__ == "__main__":
