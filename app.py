@@ -12,6 +12,7 @@ import time
 
 PORT = int(os.environ.get("PORT", 8080))
 BUF = 65536
+VERSION = 'v3-1794620452'
 
 # 同时监听多个端口：PORT（Railway HTTP 域名）+ 8081（TCP proxy 指向）
 PORTS = []
