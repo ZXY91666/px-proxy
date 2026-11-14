@@ -13,6 +13,12 @@ import time
 PORT = int(os.environ.get("PORT", 8080))
 BUF = 65536
 
+# 同时监听多个端口：PORT（Railway HTTP 域名）+ 8081（TCP proxy 指向）
+PORTS = []
+for p in (PORT, 8080, 8081, 8082):
+    if p not in PORTS:
+        PORTS.append(p)
+
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("mix")
@@ -205,18 +211,30 @@ def handle(client, addr):
             pass
 
 
-def main():
+def serve(port):
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    srv.bind(("0.0.0.0", PORT))
+    try:
+        srv.bind(("0.0.0.0", port))
+    except Exception as e:
+        log.warning("bind %d failed: %s", port, e)
+        return
     srv.listen(256)
-    log.info("=== mixed proxy listening on %d ===", PORT)
+    log.info("=== mixed proxy listening on %d ===", port)
     while True:
         try:
             c, a = srv.accept()
             threading.Thread(target=handle, args=(c, a), daemon=True).start()
         except Exception:
             continue
+
+
+def main():
+    for p in PORTS:
+        threading.Thread(target=serve, args=(p,), daemon=True).start()
+    log.info("started listeners: %s", PORTS)
+    while True:
+        time.sleep(3600)
 
 
 if __name__ == "__main__":
